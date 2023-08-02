@@ -8,17 +8,17 @@ use std::{
     io,
     pin::Pin,
     ptr::NonNull,
-    task::{Context, Poll}, rc::Rc, cell::Cell,
+    task::{Context, Poll},
 };
 
 use futures::{AsyncRead, AsyncWrite};
 
 #[derive(Debug)]
 #[pin_project::pin_project]
-pub struct DataStream<S: ?Sized>(Rc<Cell<Option<NonNull<S>>>>);
+pub struct DataStream<S: ?Sized>(NonNull<Option<NonNull<S>>>);
 
 impl<S: ?Sized> DataStream<S> {
-    pub(crate) const unsafe fn new<'a>(ptr: Rc<Cell<Option<NonNull<S>>>>) -> Self
+    pub(crate) const unsafe fn new<'a>(ptr: NonNull<Option<NonNull<S>>>) -> Self
     where
         Self: 'a,
     {
@@ -26,7 +26,7 @@ impl<S: ?Sized> DataStream<S> {
     }
 
     fn get_stream(self: Pin<&mut Self>) -> Pin<&mut S> {
-        unsafe { Pin::new_unchecked((self.0.get()).expect("asdf").as_mut()) }
+        unsafe { Pin::new_unchecked((&mut *self.0.as_ptr()).expect("Stream slot is not set").as_mut()) }
     }
 }
 

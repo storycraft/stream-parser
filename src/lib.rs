@@ -7,15 +7,13 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    cell::Cell,
     fmt::Debug,
     fmt::{self, Formatter},
     io::{self, ErrorKind, Read},
-    mem,
+    mem::{self},
     pin::Pin,
     ptr::{self, NonNull},
-    rc::Rc,
-    task::{ready, Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 use futures::{future::poll_fn, pin_mut, AsyncRead, AsyncWrite, Future, Stream, StreamExt};
@@ -24,10 +22,10 @@ use stream::DataStream;
 use crate::adapter::AsyncAdapter;
 
 pub(crate) mod adapter;
-pub mod stream;
+pub(crate) mod stream;
 
 pub struct StreamParser<Item> {
-    reader_slot: Rc<Cell<Option<NonNull<dyn AsyncRead>>>>,
+    slot: Box<Option<NonNull<dyn AsyncRead>>>,
     stream: Pin<Box<dyn Stream<Item = io::Result<Item>>>>,
 }
 
@@ -35,12 +33,12 @@ impl<Item: 'static> StreamParser<Item> {
     pub fn new(
         read_fn: impl for<'b> IoReadFnMut<'b, DataStream<dyn AsyncRead>, Item> + 'static,
     ) -> Self {
-        let reader_slot = Rc::new(Cell::new(None));
+        let mut slot = Box::new(None);
 
-        let stream_reader_slot = reader_slot.clone();
+        let slot_ptr = NonNull::from(&mut *slot);
         let stream = async_stream::stream!({
             let mut read_fn = read_fn;
-            let stream = unsafe { DataStream::new(stream_reader_slot) };
+            let stream = unsafe { DataStream::new(slot_ptr) };
             pin_mut!(stream);
 
             loop {
@@ -49,60 +47,53 @@ impl<Item: 'static> StreamParser<Item> {
         });
 
         Self {
-            reader_slot,
+            slot,
             stream: Box::pin(stream),
         }
+    }
+
+    fn poll_stream_with(&mut self, reader: Pin<&mut dyn AsyncRead>) -> Poll<io::Result<Item>> {
+        let slot = &mut *self.slot;
+        *slot = Some(NonNull::from(unsafe {
+            mem::transmute::<Pin<&mut dyn AsyncRead>, &mut dyn AsyncRead>(reader)
+        }));
+        scopeguard::defer!({
+            slot.take();
+        });
+
+        let waker = create_waker();
+        let mut fake_cx = Context::from_waker(&waker);
+
+        self.stream
+            .poll_next_unpin(&mut fake_cx)
+            .map(|res| res.unwrap_or_else(|| io::Result::Err(ErrorKind::UnexpectedEof.into())))
     }
 
     pub fn read(&mut self, reader: impl Read) -> io::Result<Item> {
         let reader = AsyncAdapter::new(reader);
         pin_mut!(reader);
 
-        self.reader_slot.set(NonNull::new(unsafe {
-            mem::transmute::<&mut dyn AsyncRead, &mut dyn AsyncRead>(&mut reader)
-        }));
-
-        let res = from_async_io(&mut self.stream, |stream, cx| {
-            Poll::Ready(
-                ready!(stream.poll_next(cx))
-                    .unwrap_or_else(|| io::Result::Err(ErrorKind::UnexpectedEof.into())),
-            )
-        });
-        self.reader_slot.take();
-
-        res
+        match self.poll_stream_with(reader) {
+            Poll::Ready(item) => item,
+            Poll::Pending => Err(ErrorKind::WouldBlock.into()),
+        }
     }
 
     pub fn poll_read(
-        mut self: Pin<&mut Self>,
+        &mut self,
         cx: &mut Context<'_>,
         reader: impl AsyncRead,
     ) -> Poll<io::Result<Item>> {
         let reader = IoWithCx::new(reader, cx);
         pin_mut!(reader);
 
-        self.reader_slot.set(NonNull::new(unsafe {
-            mem::transmute::<Pin<&mut dyn AsyncRead>, &mut dyn AsyncRead>(reader)
-        }));
-
-        let waker = create_waker();
-        let mut fake_cx = Context::from_waker(&waker);
-
-        let res = self
-            .stream
-            .poll_next_unpin(&mut fake_cx)
-            .map(|res| res.unwrap_or_else(|| io::Result::Err(ErrorKind::UnexpectedEof.into())));
-
-        self.reader_slot.take();
-
-        res
+        self.poll_stream_with(reader)
     }
 
     pub async fn read_async(&mut self, reader: impl AsyncRead) -> io::Result<Item> {
-        let mut pinned = Pin::new(self);
         pin_mut!(reader);
 
-        poll_fn(move |cx| pinned.as_mut().poll_read(cx, &mut reader)).await
+        poll_fn(move |cx| self.poll_read(cx, reader.as_mut())).await
     }
 }
 
@@ -134,14 +125,14 @@ where
 
 #[derive(Debug)]
 #[pin_project::pin_project]
-pub(crate) struct IoWithCx<'a, 'cx, S> {
+pub(crate) struct IoWithCx<'a, 'waker, S> {
     #[pin]
     stream: S,
-    cx: &'a mut Context<'cx>,
+    cx: &'a mut Context<'waker>,
 }
 
-impl<'a, 'cx, S> IoWithCx<'a, 'cx, S> {
-    pub fn new(stream: S, cx: &'a mut Context<'cx>) -> Self {
+impl<'a, 'waker, S> IoWithCx<'a, 'waker, S> {
+    pub fn new(stream: S, cx: &'a mut Context<'waker>) -> Self {
         Self { stream, cx }
     }
 }
@@ -191,17 +182,4 @@ pub(crate) fn create_waker() -> Waker {
     };
 
     unsafe { Waker::from_raw(NO_OP_RAW_WAKER) }
-}
-
-#[inline]
-pub(crate) fn from_async_io<S: Unpin, T>(
-    stream: &mut S,
-    func: impl FnOnce(Pin<&mut S>, &mut Context) -> Poll<io::Result<T>>,
-) -> io::Result<T> {
-    let waker = create_waker();
-
-    match func(Pin::new(stream), &mut Context::from_waker(&waker)) {
-        Poll::Pending => Err(ErrorKind::WouldBlock.into()),
-        Poll::Ready(res) => res,
-    }
 }
